@@ -1,0 +1,274 @@
+---
+title: "Census Migration Flow Data Processing"
+format: html
+execute:
+  echo: true
+  warning: false
+---
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# Load required packages
+library(tidyverse)
+library(rvest)
+library(httr)
+library(readxl)
+library(openxlsx)
+library(glue)
+library(purrr)
+```
+
+```{r download-functions}
+#| label: download-functions
+
+download_migration_flows <- function() {
+  # Census.gov URL
+  url <- "https://www.census.gov/data/tables/time-series/demo/geographic-mobility/state-to-state-migration.html"
+  
+  # Get the webpage content
+  response <- GET(url)
+  if (status_code(response) != 200) {
+    stop(glue("Failed to access the webpage. Status code: {status_code(response)}"))
+  }
+  
+  # Parse HTML
+  webpage <- read_html(response)
+  
+  # Find all links that match our pattern
+  pattern <- "State-to-State Migration Flows:\\s*20(0[5-9]|1[0-9]|2[0-3])"
+  
+  # Keep track of downloaded files
+  downloaded <- 0
+  skipped <- 0
+  
+  # Find all links
+  links <- webpage %>%
+    html_nodes("a") %>%
+    html_attr("href")
+  
+  texts <- webpage %>%
+    html_nodes("a") %>%
+    html_text() %>%
+    str_trim()
+  
+  # Process each link
+  for (i in seq_along(links)) {
+    text <- texts[i]
+    href <- links[i]
+    
+    # Skip if the text contains a year range
+    if (str_detect(text, "-") && str_detect(text, "20\\d{2}\\s*-\\s*20\\d{2}")) {
+      next
+    }
+    
+    if (str_detect(text, pattern)) {
+      # Extract the year
+      year <- str_extract(text, "20(0[5-9]|1[0-9]|2[0-3])")
+      
+      if (!is.na(year)) {
+        # Construct full URL
+        file_url <- url_absolute(href, "https://www.census.gov")
+        
+        # Check both possible extensions
+        xlsx_path <- glue("migration_flows_{year}.xlsx")
+        xls_path <- glue("migration_flows_{year}.xls")
+        
+        # Skip if either file exists
+        if (file.exists(xlsx_path) || file.exists(xls_path)) {
+          message(glue("File for year {year} already exists, skipping..."))
+          skipped <- skipped + 1
+          next
+        }
+        
+        tryCatch({
+          # Download the file with updated headers
+          headers <- c(
+            'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept' = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel'
+          )
+          
+          message(glue("Downloading file for year {year}..."))
+          message(glue("URL: {file_url}"))
+          
+          file_response <- GET(file_url, add_headers(headers))
+          content_type <- headers(file_response)$`content-type`
+          message(glue("Content-Type: {content_type}"))
+          
+          if (status_code(file_response) == 200) {
+            # Determine file extension based on content type
+            extension <- if (str_detect(content_type, "application/vnd.ms-excel")) ".xls" else ".xlsx"
+            
+            # Update filename with correct extension
+            filename <- glue("migration_flows_{year}{extension}")
+            
+            # Save the file
+            writeBin(content(file_response), filename)
+            
+            # Verify the file is a valid Excel file
+            tryCatch({
+              if (extension == ".xls") {
+                df <- read_excel(filename)
+              } else {
+                df <- read_excel(filename)
+              }
+              downloaded <- downloaded + 1
+              message(glue("Successfully downloaded and verified {filename}"))
+            }, error = function(e) {
+              message(glue("Downloaded file is not a valid Excel file: {e$message}"))
+              file.remove(filename)
+            })
+          } else {
+            message(glue("Failed to download file for year {year}. Status code: {status_code(file_response)}"))
+          }
+        }, error = function(e) {
+          message(glue("Error downloading file for year {year}: {e$message}"))
+        })
+      }
+    }
+  }
+  
+  message(glue("\nDownload complete. Successfully downloaded {downloaded} files, skipped {skipped} existing files."))
+}
+```
+
+```{r process-functions}
+#| label: process-functions
+
+process_migration_file <- function(file_path) {
+  tryCatch({
+    if (str_starts(basename(file_path), "~\\$")) {  # Skip temporary Excel files
+      return(NULL)
+    }
+    
+    message(glue("Processing file: {file_path}"))
+    
+    # Read the Excel file
+    df <- read_excel(file_path)
+    
+    # Get the year from the filename
+    year <- as.integer(str_extract(file_path, "\\d{4}"))
+    message(glue("Extracted year: {year}"))
+    
+    # Drop the last rows (3 for pre-2010, 8 for 2010+)
+    if (year >= 2010) {
+      df <- df %>% slice(1:(nrow(df) - 8))
+    } else {
+      df <- df %>% slice(1:(nrow(df) - 3))
+    }
+    
+    # Find columns that contain 'MOE' as a value and drop them
+    moe_columns <- df %>%
+      select(where(~any(str_detect(as.character(.), "MOE")))) %>%
+      names()
+    
+    df <- df %>% select(-all_of(moe_columns))
+    
+    # Drop the first 5 rows
+    df <- df %>% slice(6:nrow(df))
+    
+    # Drop rows where all values are missing
+    df <- df %>% drop_na(where(~!all(is.na(.))))
+    
+    # Drop specific rows
+    tryCatch({
+      if (year >= 2010) {
+        df <- df %>% slice(-c(2, 3, 31, 32, 33))
+      } else {
+        df <- df %>% slice(-c(2, 33, 34, 35))
+      }
+    }, error = function(e) NULL)
+    
+    # Make the first row first column equal to 0
+    df[1, 1] <- 0
+    
+    # Set the first column as the index
+    first_col <- names(df)[1]
+    df <- df %>% column_to_rownames(first_col)
+    
+    # Drop columns where the first row has missing values
+    df <- df[, !is.na(df[1, ])]
+    
+    # Get states from the first row
+    states <- as.character(df[1, ])
+    
+    # Create flows dataframe
+    data <- list()
+    row_idx <- 1
+    
+    for (i in 2:nrow(df)) {
+      for (j in 1:ncol(df)) {
+        value <- df[i, j]
+        if (!is.na(value) && str_trim(as.character(value)) != "") {
+          tryCatch({
+            # Convert value to numeric, handling any commas
+            clean_value <- str_replace_all(as.character(value), ",", "")
+            float_value <- as.numeric(clean_value)
+            
+            data[[row_idx]] <- list(
+              From = states[j],
+              To = rownames(df)[i],
+              Year = year,
+              Population_Change = float_value
+            )
+            row_idx <- row_idx + 1
+          }, error = function(e) NULL)
+        }
+      }
+    }
+    
+    result_df <- bind_rows(data)
+    message(glue("Successfully processed {file_path}, created {nrow(result_df)} rows"))
+    return(result_df)
+    
+  }, error = function(e) {
+    message(glue("Error processing {file_path}: {e$message}"))
+    return(NULL)
+  })
+}
+```
+
+```{r execute-download}
+#| label: execute-download
+
+# Download the migration flow files
+download_migration_flows()
+```
+
+```{r execute-processing}
+#| label: execute-processing
+
+# Get all Excel files in the directory
+excel_files <- list.files(pattern = "\\.xls[x]?$")
+message(glue("Found {length(excel_files)} Excel files: {paste(excel_files, collapse = ', ')}"))
+
+# Process all files and store results in a list
+all_flows <- map(excel_files, process_migration_file) %>%
+  compact()
+
+# Check if we have any processed data
+if (length(all_flows) > 0) {
+  # Combine all flows into one dataframe
+  combined_flows <- bind_rows(all_flows)
+  message(glue("Created combined dataset with {nrow(combined_flows)} rows"))
+  
+  # Remove rows where From and To are the same
+  combined_flows <- combined_flows %>%
+    filter(From != To)
+  
+  # Remove specific locations
+  locations_to_remove <- c('Total', 'U.S. Island Area', 'Foreign Country', 
+                         'Foreign Country4', 'U.S. Island Area3', 'Puerto Rico')
+  
+  combined_flows <- combined_flows %>%
+    filter(!From %in% locations_to_remove,
+           !To %in% locations_to_remove)
+  
+  # Save the combined results
+  write_csv(combined_flows, "migration_flows_combined.csv")
+  message("Saved results to migration_flows_combined.csv")
+} else {
+  message("No files were successfully processed!")
+}
+``` 
