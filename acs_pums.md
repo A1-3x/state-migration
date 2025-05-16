@@ -130,3 +130,123 @@ recent_mover = MIG != 1  # 1 = Same house last year
 ---
 
 Let me know if you want R or Python code templates, or a guide to downloading the right data from IPUMS.
+
+Great! Below are **code templates in both R and Python** to help you analyze ACS PUMS data for migration-related questions.
+
+---
+
+## 📁 Data Assumptions
+
+These templates assume you are working with **ACS PUMS CSV files** downloaded from [IPUMS-USA](https://usa.ipums.org/usa/), which include:
+
+* **Person-level data** (e.g., `usa_00001.csv`)
+* Corresponding **codebook** (usually `*.do` or `*.xml`) for variable meanings
+
+---
+
+## 🐍 Python Template (Using `pandas`)
+
+```python
+import pandas as pd
+
+# Load the data
+df = pd.read_csv("usa_00001.csv")
+
+# Convert missing values (IPUMS codes missing as specific integers like 9999999)
+df.replace({9999999: pd.NA, 999999: pd.NA, 999: pd.NA}, inplace=True)
+
+# Subset working-age population
+df = df[(df['AGE'] >= 25) & (df['AGE'] <= 64)]
+
+# Create migration flag (moved from different state)
+df['interstate_mover'] = df['MIGSP'] != df['STATEFIP']  # MIGSP = state 1 year ago, STATEFIP = current
+
+# Create binary education variable (college degree or higher)
+df['college_grad'] = df['EDUC'].apply(lambda x: 1 if x >= 101 else 0)  # IPUMS code 101+ = Bachelor's+
+
+# Drop missing values in key columns
+df = df.dropna(subset=['interstate_mover', 'college_grad', 'INCTOT'])
+
+# Run logistic regression
+import statsmodels.api as sm
+
+X = df[['college_grad', 'AGE', 'INCTOT']]  # Add other variables as needed
+X = sm.add_constant(X)
+y = df['interstate_mover'].astype(int)
+
+model = sm.Logit(y, X)
+result = model.fit()
+print(result.summary())
+```
+
+---
+
+## 📊 R Template (Using `tidyverse` + `survey`)
+
+```r
+library(tidyverse)
+library(survey)
+
+# Load data
+df <- read_csv("usa_00001.csv")
+
+# Subset working-age population
+df <- df %>%
+  filter(AGE >= 25, AGE <= 64)
+
+# Create migration variable
+df <- df %>%
+  mutate(interstate_mover = if_else(MIGSP != STATEFIP, 1, 0),
+         college_grad = if_else(EDUC >= 101, 1, 0))  # Bachelor's or higher
+
+# Remove rows with missing values in key vars
+df_clean <- df %>%
+  drop_na(interstate_mover, college_grad, INCTOT)
+
+# Set up survey design using person weights
+design <- svydesign(ids = ~1, weights = ~PERWT, data = df_clean)
+
+# Logistic regression
+model <- svyglm(interstate_mover ~ college_grad + AGE + INCTOT, 
+                design = design, 
+                family = quasibinomial())
+
+summary(model)
+```
+
+---
+
+## 🛠 Notes on Customization
+
+### Data Columns (IPUMS)
+
+| Variable   | Description                       |
+| ---------- | --------------------------------- |
+| `MIGSP`    | State 1 year ago                  |
+| `STATEFIP` | Current state                     |
+| `AGE`      | Age                               |
+| `EDUC`     | Educational attainment            |
+| `INCTOT`   | Total personal income             |
+| `PERWT`    | Person weight (use for estimates) |
+
+> You can verify these column codes in the IPUMS codebook or online variable documentation.
+
+---
+
+## 📥 Optional: Download with IPUMS Extract API
+
+You can automate downloading and loading data via [IPUMS API](https://developer.ipums.org/), or you can use their website interface to select:
+
+* **Person-level ACS PUMS**
+* Variables like: `AGE`, `MIGSP`, `STATEFIP`, `EDUC`, `INCTOT`, `PERWT`
+
+---
+
+Let me know if you'd like:
+
+* Code to handle **multi-year pooling**
+* Geographic breakdowns using **PUMA**
+* Visualization of migration flows or rates
+
+I'm happy to expand on any part.
+
